@@ -1,2 +1,2 @@
 # lemonade-server-model-manager
-Minimal WebUI for Lemonade-server for Model Management.
+Minimal Model Management WebUI for Lemonade-server.
