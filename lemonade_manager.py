@@ -201,14 +201,14 @@ async def index(request: Request):
         # 3. Loaded Column
         if is_loaded:
             loaded_html = f"""
-            <div>â</div>
+            <div>✅</div>
             <form method="post" action="/unload/model" style="margin-top:0.2rem;">
               <input type="hidden" name="model_name" value="{esc(mid)}">
               <button type="submit">Unload</button>
             </form>
             """
         else:
-            loaded_html = "â"
+            loaded_html = "❌"
 
         # 4. Actions / Defaults Column
         if is_disabled:
@@ -251,7 +251,7 @@ async def index(request: Request):
         <tr style="{row_style}">
           <td>{id_html}</td>
           <td>{recipe_html}</td>
-          <td>{'â' if downloaded else 'â'}</td>
+          <td>{'✅' if downloaded else '❌'}</td>
           <td>{loaded_html}</td>
           <td>{actions_html}</td>
         </tr>
