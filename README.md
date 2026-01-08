@@ -4,6 +4,9 @@ A lightweight, single-file Web UI manager for [Lemonade Server](https://github.c
 
 This tool provides a clean interface to load, unload, and configure models running on your local Lemonade instance. It is designed to run alongside the Lemonade server and persists configuration preferences directly to your Lemonade recipe path.
 
+## Screenshot
+![lemonade_manager_screenshot](https://github.com/user-attachments/assets/8211dd49-58dd-4044-9700-8a8b028c0e19)
+
 ## Features
 
 * **Model Management:** View all available models, their load status, and download status.
@@ -20,7 +23,7 @@ This tool provides a clean interface to load, unload, and configure models runni
 
 ## Installation (Virtual Environment)
 
-1. **Clone or download** the `lemonade_manager.py` file to your desired directory (e.g., `/opt/lemonade-manager`).
+1. **Clone or download** the `lemonade_manager.py` and `requirements.txt` file to your desired directory (e.g., `/opt/lemonade-manager`).
 2. **Create a virtual environment** to keep dependencies isolated:
    ```bash
    python3 -m venv venv
@@ -36,7 +39,8 @@ This tool provides a clean interface to load, unload, and configure models runni
 
 ## Usage
 
-**Manual Start:**
+**Manual Start**
+
 Ensure your virtual environment is active, then run:
 
 ```bash
@@ -46,6 +50,7 @@ python lemonade_manager.py
 By default, the UI will be accessible at http://localhost:9000.
 
 **Environment Variables**
+
 You can override defaults by setting environment variables before running the script:
 | Variable | Default | Description |
 |---|---|---|
@@ -57,6 +62,7 @@ You can override defaults by setting environment variables before running the sc
 | TIMEOUT_LIGHT | 10.0 | Timeout (seconds) for light operations like stats or health checks. |
 
 **Running as a System Service (Systemd)**
+
 For a persistent home lab setup (e.g., on Proxmox or Ubuntu), use systemd to auto-start the manager.
 1. Create the service file:
 ```bash
