@@ -63,7 +63,7 @@ You can override defaults by setting environment variables before running the sc
 
 **Running as a System Service (Systemd)**
 
-For a persistent home lab setup (e.g., on Proxmox or Ubuntu), use systemd to auto-start the manager.
+For a persistent setup, use systemd to auto-start the manager.
 1. Create the service file:
 ```bash
 sudo nano /etc/systemd/system/lemonade-manager.service
