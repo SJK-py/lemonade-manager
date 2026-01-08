@@ -11,7 +11,7 @@ This tool provides a clean interface to load, unload, and configure models runni
 
 * **Model Management:** View all available models, their load status, and download status.
 * **Load/Unload Controls:** Quickly start or stop models with a single click.
-* **Persistent Configuration:** Save default context sizes (`ctx_size`), `llamacpp_args`, and backend preferences (e.g., `vulkan`, `cuda`) to `recipe_options.json`.
+* **Persistent Configuration:** Save default context sizes (`ctx_size`), `llamacpp_args`, and backend preferences (e.g., `vulkan`, `rocm`) to `recipe_options.json`.
 * **Backend Overrides:** dedicated input for specifying `llamacpp_backend` (useful for testing Vulkan vs CPU offloading on the fly).
 * **Hiding Models:** "Disable" models to hide them from the main view without deleting the files (stored locally in `manager_prefs.json`).
 * **Responsive UI:** Dark-mode enabled, lightweight HTML/CSS interface with zero external frontend dependencies.
