@@ -1,11 +1,17 @@
 # lemonade_manager.py
-# v2.0
+# v2.2
 # =============================================================================
 # v1.0 -> v2.0
 # - Added env var LEMONADE_KEY, MANAGER_HOST, TIMEOUT_PULL
 # - Implemented POST /api/v1/pull, POST /api/v1/delete
 # - Refactored httpx calls
 # - Reinforced comments
+# v2.0 -> v2.1
+# - Fixed mmproj checkbox behavior
+# - Fixed pulling model streaming behavior
+# - Add sanitization of pref json file
+# v2.1 -> v2.2
+# - Increased keepalive limit in /pull/stream
 # =============================================================================
 import os
 import json
@@ -129,12 +135,29 @@ def set_model_options(
 # STORAGE: LOCAL MANAGER PREFS (manager_prefs.json)
 # =============================================================================
 
-def get_disabled_models() -> Set[str]:
-    """Reads the local list of 'disabled' (hidden) models."""
+def get_disabled_models(available_ids: Optional[Set[str]] = None) -> Set[str]:
+    """
+    Reads the local list of 'disabled' (hidden) models.
+    If available_ids is provided, it sanitizes the file by removing 
+    entries that no longer exist on the server.
+    """
     if PREFS_FILE.exists():
         try:
             data = json.loads(PREFS_FILE.read_text(encoding="utf-8"))
-            return set(data.get("disabled", []))
+            stored_disabled = set(data.get("disabled", []))
+            
+            # Sanitize: If available model IDs are given, remove orphans. (v2.1)
+            if available_ids is not None:
+                # Keep only disabled models that are actually in the available list
+                cleaned_disabled = stored_disabled.intersection(available_ids)
+                
+                # If removed something, save the file immediately
+                if len(cleaned_disabled) != len(stored_disabled):
+                    save_data = {"disabled": sorted(list(cleaned_disabled))}
+                    PREFS_FILE.write_text(json.dumps(save_data, indent=2), encoding="utf-8")
+                    return cleaned_disabled
+                
+            return stored_disabled
         except Exception:
             return set()
     return set()
@@ -248,6 +271,9 @@ async def index(request: Request):
 
     data = models.get("data", [])
 
+    # Create a set of all valid model IDs currently on the server
+    current_model_ids = {m.get("id") for m in data if m.get("id")}
+
     # Identify currently loaded models
     loaded_ids = set()
     if isinstance(health, dict):
@@ -256,7 +282,8 @@ async def index(request: Request):
             if mid:
                 loaded_ids.add(mid)
 
-    disabled_models = get_disabled_models()
+    # Fetch disabled models, passing current_model_ids to trigger sanitization
+    disabled_models = get_disabled_models(available_ids=current_model_ids)
 
     def esc(s: Any):
         return (str(s) or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -581,43 +608,66 @@ async def index(request: Request):
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             
+            let buffer = "";
+            let currentEvent = null; // Track the current SSE event type
+
             while (true) {{
                 const {{ done, value }} = await reader.read();
                 if (done) break;
                 
-                const chunk = decoder.decode(value);
-                // SSE format usually sends "event: ... \n data: ... \n\n"
-                // Simple parsing for display:
-                const lines = chunk.split('\\n');
-                let bufferHtml = "";
+                // 1. Buffer incoming bytes to handle split lines correctly
+                buffer += decoder.decode(value, {{stream: true}});
+                const lines = buffer.split('\\n');
                 
-                lines.forEach(line => {{
-                    if(line.startsWith('data: ')) {{
+                // Keep the last line in the buffer as it might be incomplete
+                buffer = lines.pop(); 
+                
+                for (const line of lines) {{
+                    const trimmed = line.trim();
+                    if (!trimmed) continue;
+
+                    // 2. Parse Event Type
+                    if (trimmed.startsWith('event:')) {{
+                        currentEvent = trimmed.substring(6).trim();
+                    }}
+                    // 3. Parse Data
+                    else if (trimmed.startsWith('data:')) {{
+                        const jsonStr = trimmed.substring(5).trim();
                         try {{
-                            const jsonData = JSON.parse(line.substring(6));
-                            if (jsonData.percent) {{
-                                bufferHtml += `<div class="progress-line">Progress: ${{jsonData.percent}}% - File index: ${{jsonData.file_index || '?'}}</div>`;
-                            }} else if (jsonData.error) {{
-                                bufferHtml += `<div style="color:red">Error: ${{jsonData.error}}</div>`;
-                            }} else {{
-                                bufferHtml += `<div>${{JSON.stringify(jsonData)}}</div>`;
+                            const data = JSON.parse(jsonStr);
+
+                            // CHECK: Error
+                            if (currentEvent === 'error' || data.error) {{
+                                logBox.innerHTML += `<div style="color:red">Error: ${{data.error || 'Unknown'}}</div>`;
+                                return; // Stop execution
                             }}
-                        }} catch (e) {{ 
-                           // ignore incomplete json chunks
+
+                            // CHECK: Complete -> BREAK LOOP
+                            if (currentEvent === 'complete') {{
+                                logBox.innerHTML += "<div style='color:#6ee7b7; font-weight:bold; margin-top:10px;'>Download Complete. Reloading...</div>";
+                                logBox.scrollTop = logBox.scrollHeight;
+                                setTimeout(() => window.location.reload(), 2000);
+                                return; // explicit exit
+                            }}
+
+                            // CHECK: Progress
+                            if (currentEvent === 'progress' || data.percent) {{
+                                // Optimization: Update a single element to prevent infinite scrolling spam
+                                let statusLine = document.getElementById('progress-dynamic');
+                                if (!statusLine) {{
+                                    statusLine = document.createElement('div');
+                                    statusLine.id = 'progress-dynamic';
+                                    statusLine.className = 'progress-line';
+                                    logBox.appendChild(statusLine);
+                                }}
+                                statusLine.innerText = `Downloading ${{data.file || 'file'}}... ${{data.percent}}%`;
+                            }}
+                        }} catch (e) {{
+                           // Ignore parse errors from malformed/interrupted lines
                         }}
                     }}
-                }});
-                
-                if (bufferHtml) {{
-                    logBox.innerHTML += bufferHtml;
-                    logBox.scrollTop = logBox.scrollHeight;
                 }}
             }}
-            
-            // Done
-            logBox.innerHTML += "<div style='color:#6ee7b7; font-weight:bold; margin-top:10px;'>Process Complete. Reloading...</div>";
-            setTimeout(() => window.location.reload(), 2000);
-
         }} catch (err) {{
             logBox.innerHTML += `<div style="color:red">Network Error: ${{err}}</div>`;
             document.getElementById('pull-actions').style.display = 'flex';
@@ -714,9 +764,9 @@ async def index(request: Request):
             </div>
 
             <div class="form-group">
-                <label class="form-label">Multimodal Projector (Optional)</label>
+                <label class="form-label" for="mmproj_enabled">Multimodal Projector (Optional)</label>
                 <div class="checkbox-wrapper">
-                    <input type="checkbox" id="mmproj_enabled" onchange="toggleMmproj()">
+                    <input type="checkbox" id="mmproj_enabled" onclick="toggleMmproj()">
                     <input type="text" id="mmproj_input" name="mmproj" class="form-control" placeholder="mmproj file path" disabled>
                 </div>
             </div>
@@ -835,21 +885,29 @@ async def pull_model_stream(
 
     # Create a generator to stream bytes from the upstream server to the client
     async def event_generator() -> AsyncGenerator[bytes, None]:
-        async with httpx.AsyncClient(timeout=TIMEOUT_PULL) as client:
-            # Use build_request/send to handle the streaming response properly
-            req = client.build_request(
-                "POST", 
-                f"{LEMONADE_BASE}/api/v1/pull", 
-                json=payload,
-                headers=get_headers()
-            )
+        # Increase connection pool limits and keepalive specifically for this long request
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10, keepalive_expiry=TIMEOUT_PULL)
+        
+        async with httpx.AsyncClient(timeout=TIMEOUT_PULL, limits=limits) as client:
             try:
+                # Use build_request/send to handle the streaming response properly
+                req = client.build_request(
+                    "POST", 
+                    f"{LEMONADE_BASE}/api/v1/pull", 
+                    json=payload,
+                    headers=get_headers()
+                )
                 r = await client.send(req, stream=True)
                 r.raise_for_status()
+                
                 async for chunk in r.aiter_bytes():
                     yield chunk
+
+            except httpx.RemoteProtocolError:
+                # This specific error means the server hung up
+                err_msg = json.dumps({"error": "Connection lost: Lemonade Server closed the connection. Check server logs for crashes or disk space issues."})
+                yield f"data: {err_msg}\n\n".encode('utf-8')
             except httpx.HTTPStatusError as e:
-                # If immediate error, yield it as a data event so frontend can see it
                 err_msg = json.dumps({"error": f"Upstream Error: {e.response.text}"})
                 yield f"data: {err_msg}\n\n".encode('utf-8')
             except Exception as e:
