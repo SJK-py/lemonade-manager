@@ -70,6 +70,7 @@ You can override defaults by setting environment variables before running the sc
 | TIMEOUT_LIGHT | 10.0 | Timeout (seconds) for light ops (stats, health checks). |
 
 **Pulling New Models**
+
 The Manager includes a "Pull New Model" section at the bottom of the UI.
 * Model Name: The identifier for the model (e.g., user.mistral-7b).
 * Checkpoint: The HuggingFace ID (e.g., unsloth/Phi-4-mini-instruct-GGUF:Q4_K_M).
