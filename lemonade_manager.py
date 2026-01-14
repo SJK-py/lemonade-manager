@@ -1,29 +1,50 @@
 # lemonade_manager.py
+# v2.2
+# =============================================================================
+# v1.0 -> v2.0
+# - Added env var LEMONADE_KEY, MANAGER_HOST, TIMEOUT_PULL
+# - Implemented POST /api/v1/pull, POST /api/v1/delete
+# - Refactored httpx calls
+# - Reinforced comments
+# v2.0 -> v2.1
+# - Fixed mmproj checkbox behavior
+# - Fixed pulling model streaming behavior
+# - Add sanitization of pref json file
+# v2.1 -> v2.2
+# - Increased keepalive limit in /pull/stream
+# =============================================================================
 import os
 import json
 import uvicorn
 import httpx
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+import asyncio
+from fastapi import FastAPI, Form, Request, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, StreamingResponse
 from pathlib import Path
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, AsyncGenerator
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-# All settings can be overridden via environment variables.
 
 # The base URL of the Lemonade Server instance
 LEMONADE_BASE = os.getenv("LEMONADE_BASE", "http://localhost:8000")
 
+# Optional API Key for Lemonade Server (Bearer Token)
+# If set, this will be added to the Authorization header of every request.
+LEMONADE_KEY = os.getenv("LEMONADE_KEY", "")
+
+# Host interface to bind the Manager UI to.
+# Default: 0.0.0.0
+MANAGER_HOST = os.getenv("MANAGER_HOST", "0.0.0.0")
+
 # Port for this Manager UI
 MANAGER_PORT = int(os.getenv("MANAGER_PORT", "9000"))
 
-# Timeout for heavy operations (like loading a model) in seconds
-TIMEOUT_LOAD = float(os.getenv("TIMEOUT_LOAD", "120.0"))
-
-# Timeout for light operations (stats, health checks)
-TIMEOUT_LIGHT = float(os.getenv("TIMEOUT_LIGHT", "10.0"))
+# Timeout settings (in seconds)
+TIMEOUT_LOAD = float(os.getenv("TIMEOUT_LOAD", "120.0"))   # Loading a model
+TIMEOUT_LIGHT = float(os.getenv("TIMEOUT_LIGHT", "10.0"))  # Stats/Health/Delete
+TIMEOUT_PULL = float(os.getenv("TIMEOUT_PULL", "3600.0"))  # Pulling/Downloading (can take a long time)
 
 # Path to the native Lemonade Server configuration file.
 # Default: ~/.cache/lemonade/recipe_options.json
@@ -60,19 +81,17 @@ def save_recipe_options(data: Dict[str, Dict[str, Any]]) -> None:
     Writes to the native lemonade-server configuration file.
     Ensures the directory exists before writing.
     """
-    # Ensure parent directory exists (e.g., ~/.cache/lemonade/)
     if not RECIPE_FILE.parent.exists():
         try:
             RECIPE_FILE.parent.mkdir(parents=True, exist_ok=True)
         except OSError:
-            pass # If we can't create it, the write below will likely fail/log error
+            pass 
 
     RECIPE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 def get_model_options(model_name: str) -> Dict[str, Any]:
     """Retrieves options for a specific model from the global recipe file."""
     all_opts = load_recipe_options()
-    # The native schema is flat: {"model_id": {...params...}}
     return all_opts.get(model_name, {})
 
 def set_model_options(
@@ -86,11 +105,8 @@ def set_model_options(
     Removes empty keys to keep the JSON clean.
     """
     all_opts = load_recipe_options()
-
-    # Initialize entry if not present
     entry = all_opts.get(model_name, {})
 
-    # Update fields only if they are provided (not None)
     if ctx_size is not None:
         entry["ctx_size"] = ctx_size
 
@@ -99,16 +115,15 @@ def set_model_options(
         if clean_args:
             entry["llamacpp_args"] = clean_args
         elif "llamacpp_args" in entry:
-            del entry["llamacpp_args"]  # Remove empty args if cleared by user
+            del entry["llamacpp_args"]
 
     if llamacpp_backend is not None:
         clean_backend = llamacpp_backend.strip()
         if clean_backend:
             entry["llamacpp_backend"] = clean_backend
         elif "llamacpp_backend" in entry:
-            del entry["llamacpp_backend"] # Remove empty backend
+            del entry["llamacpp_backend"]
 
-    # Clean up: If entry is empty, remove the model key entirely
     if entry:
         all_opts[model_name] = entry
     elif model_name in all_opts:
@@ -120,12 +135,29 @@ def set_model_options(
 # STORAGE: LOCAL MANAGER PREFS (manager_prefs.json)
 # =============================================================================
 
-def get_disabled_models() -> Set[str]:
-    """Reads the local list of 'disabled' (hidden) models."""
+def get_disabled_models(available_ids: Optional[Set[str]] = None) -> Set[str]:
+    """
+    Reads the local list of 'disabled' (hidden) models.
+    If available_ids is provided, it sanitizes the file by removing 
+    entries that no longer exist on the server.
+    """
     if PREFS_FILE.exists():
         try:
             data = json.loads(PREFS_FILE.read_text(encoding="utf-8"))
-            return set(data.get("disabled", []))
+            stored_disabled = set(data.get("disabled", []))
+            
+            # Sanitize: If available model IDs are given, remove orphans. (v2.1)
+            if available_ids is not None:
+                # Keep only disabled models that are actually in the available list
+                cleaned_disabled = stored_disabled.intersection(available_ids)
+                
+                # If removed something, save the file immediately
+                if len(cleaned_disabled) != len(stored_disabled):
+                    save_data = {"disabled": sorted(list(cleaned_disabled))}
+                    PREFS_FILE.write_text(json.dumps(save_data, indent=2), encoding="utf-8")
+                    return cleaned_disabled
+                
+            return stored_disabled
         except Exception:
             return set()
     return set()
@@ -145,22 +177,32 @@ def set_disabled(model_name: str, disabled: bool) -> None:
 # API CLIENT HELPERS
 # =============================================================================
 
+def get_headers() -> Dict[str, str]:
+    """Generates headers for Lemonade Server requests, including Auth."""
+    headers = {}
+    if LEMONADE_KEY:
+        headers["Authorization"] = f"Bearer {LEMONADE_KEY}"
+    return headers
+
 async def get_models():
+    """Fetches list of available models."""
     async with httpx.AsyncClient(timeout=TIMEOUT_LIGHT) as client:
-        r = await client.get(f"{LEMONADE_BASE}/api/v1/models")
+        r = await client.get(f"{LEMONADE_BASE}/api/v1/models", headers=get_headers())
         r.raise_for_status()
         return r.json()
 
 async def get_health():
+    """Fetches server health status (currently loaded models)."""
     async with httpx.AsyncClient(timeout=TIMEOUT_LIGHT) as client:
-        r = await client.get(f"{LEMONADE_BASE}/api/v1/health")
+        r = await client.get(f"{LEMONADE_BASE}/api/v1/health", headers=get_headers())
         r.raise_for_status()
         return r.json()
 
 async def get_stats():
+    """Fetches performance stats."""
     async with httpx.AsyncClient(timeout=TIMEOUT_LIGHT) as client:
         try:
-            r = await client.get(f"{LEMONADE_BASE}/api/v1/stats")
+            r = await client.get(f"{LEMONADE_BASE}/api/v1/stats", headers=get_headers())
             if r.status_code == 200:
                 return r.json()
         except Exception:
@@ -173,10 +215,7 @@ async def do_load(
     llamacpp_args: Optional[str],
     llamacpp_backend: Optional[str]
 ):
-    """
-    Sends the load command to Lemonade Server.
-    Uses the configurable TIMEOUT_LOAD.
-    """
+    """Sends the load command to Lemonade Server."""
     payload: Dict[str, Any] = {"model_name": model_name}
 
     if ctx_size:
@@ -187,13 +226,24 @@ async def do_load(
         payload["llamacpp_backend"] = llamacpp_backend.strip()
 
     async with httpx.AsyncClient(timeout=TIMEOUT_LOAD) as client:
-        r = await client.post(f"{LEMONADE_BASE}/api/v1/load", json=payload)
+        r = await client.post(f"{LEMONADE_BASE}/api/v1/load", json=payload, headers=get_headers())
         r.raise_for_status()
 
 async def do_unload_model(model_name: str):
+    """Unloads a specific model."""
     payload = {"model_name": model_name}
     async with httpx.AsyncClient(timeout=TIMEOUT_LIGHT) as client:
-        r = await client.post(f"{LEMONADE_BASE}/api/v1/unload", json=payload)
+        r = await client.post(f"{LEMONADE_BASE}/api/v1/unload", json=payload, headers=get_headers())
+        r.raise_for_status()
+
+async def do_delete_model(model_name: str):
+    """
+    Deletes a model from local storage.
+    Note: Lemonade Server will unload it first if it is running.
+    """
+    payload = {"model_name": model_name}
+    async with httpx.AsyncClient(timeout=TIMEOUT_LIGHT) as client:
+        r = await client.post(f"{LEMONADE_BASE}/api/v1/delete", json=payload, headers=get_headers())
         r.raise_for_status()
 
 # =============================================================================
@@ -208,17 +258,21 @@ async def index(request: Request):
         health = await get_health()
         stats = await get_stats()
     except Exception as e:
-        # Graceful failure if server is down
+        # Graceful failure if server is down or Auth failed
         return HTMLResponse(f"""
             <html><body style="font-family:sans-serif; background:#0b0b0e; color:#e5e7eb; padding:2rem;">
             <h1>Connection Error</h1>
             <p>Could not connect to Lemonade Server at <code>{LEMONADE_BASE}</code></p>
+            <p><strong>Note:</strong> If the server requires an API Key, ensure <code>LEMONADE_KEY</code> is set.</p>
             <pre>{str(e)}</pre>
             <p><a href="/" style="color:#60a5fa;">Retry</a></p>
             </body></html>
         """)
 
     data = models.get("data", [])
+
+    # Create a set of all valid model IDs currently on the server
+    current_model_ids = {m.get("id") for m in data if m.get("id")}
 
     # Identify currently loaded models
     loaded_ids = set()
@@ -228,9 +282,9 @@ async def index(request: Request):
             if mid:
                 loaded_ids.add(mid)
 
-    disabled_models = get_disabled_models()
+    # Fetch disabled models, passing current_model_ids to trigger sanitization
+    disabled_models = get_disabled_models(available_ids=current_model_ids)
 
-    # Safe HTML escaping helper
     def esc(s: Any):
         return (str(s) or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -242,42 +296,49 @@ async def index(request: Request):
         is_loaded = mid in loaded_ids
         is_disabled = mid in disabled_models
 
-        # Heuristic to determine if we should show backend options
         is_llamacpp = "llamacpp" in recipe.lower() or "gguf" in mid.lower() or "gguf" in recipe.lower()
 
-        # Fetch stored options from recipe_options.json
         defaults = get_model_options(mid)
         def_ctx = defaults.get("ctx_size", "")
         def_args = defaults.get("llamacpp_args", "")
         def_backend = defaults.get("llamacpp_backend", "")
 
-        # Visual styling for disabled/enabled rows
         row_class = "disabled-row" if is_disabled else ""
         form_id = f"form-{mid}"
 
-        # ------------------ 1. ID / Enable Toggle ------------------
+        # ------------------ 1. ID / Enable / Delete ------------------
+        # Added Delete button here (v2.0)
+        delete_btn_html = f"""
+        <button type="button" class="btn-xs btn-outline btn-trash" 
+            onclick="showDeleteConfirm('{esc(mid)}')" title="Delete Model">🗑️</button>
+        """
+
         if is_disabled:
             id_html = f"""
             <div class="model-id">{esc(mid)}</div>
-            <form method="post" action="/disable" class="inline-form">
-              <input type="hidden" name="model_name" value="{esc(mid)}">
-              <input type="hidden" name="disabled" value="0">
-              <button type="submit" class="btn-xs">Enable</button>
-            </form>
+            <div class="btn-group">
+                <form method="post" action="/disable" class="inline-form">
+                  <input type="hidden" name="model_name" value="{esc(mid)}">
+                  <input type="hidden" name="disabled" value="0">
+                  <button type="submit" class="btn-xs">Enable</button>
+                </form>
+                {delete_btn_html}
+            </div>
             """
         else:
             id_html = f"""
             <div class="model-id">{esc(mid)}</div>
-            <form method="post" action="/disable" class="inline-form">
-              <input type="hidden" name="model_name" value="{esc(mid)}">
-              <input type="hidden" name="disabled" value="1">
-              <button type="submit" class="btn-xs btn-outline">Disable</button>
-            </form>
+            <div class="btn-group">
+                <form method="post" action="/disable" class="inline-form">
+                  <input type="hidden" name="model_name" value="{esc(mid)}">
+                  <input type="hidden" name="disabled" value="1">
+                  <button type="submit" class="btn-xs btn-outline">Disable</button>
+                </form>
+                {delete_btn_html}
+            </div>
             """
 
-        # ------------------ 2. Recipe / Backend Input ------------------
-        # If llamacpp, show a text box for the backend.
-        # This input is linked to the main form via form="{form_id}"
+        # ------------------ 2. Recipe / Backend ------------------
         if is_llamacpp and not is_disabled:
             recipe_html = f"""
             <div class="recipe-text">{esc(recipe)}</div>
@@ -303,16 +364,14 @@ async def index(request: Request):
         else:
             status_html = '<div class="status-badge">Stopped</div>'
 
-        # ------------------ 4. Actions / Defaults ------------------
+        # ------------------ 4. Actions ------------------
         if is_disabled:
             actions_html = f"""
             <div class="text-muted text-sm">
-              <em>Model is hidden (disabled). Enable to configure.</em>
+              <em>Model is hidden. Enable to configure.</em>
             </div>
             """
         else:
-            # Main configuration form
-            # Two sets of buttons: Load (Default) vs Load (Custom)
             actions_html = f"""
             <form id="{form_id}" method="post" class="action-form" onsubmit="showLoading()">
                 <input type="hidden" name="model_name" value="{esc(mid)}">
@@ -349,7 +408,7 @@ async def index(request: Request):
         </tr>
         """)
 
-    # Optional stats section
+    # Stats Section
     stats_html = ""
     if stats:
         stats_html = f"""
@@ -386,6 +445,7 @@ async def index(request: Request):
 
     /* Layout */
     .toolbar {{ display: flex; justify-content: space-between; align-items: center; background: var(--bg-panel); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 1.5rem; flex-wrap: wrap; gap: 1rem; }}
+    .section-container {{ margin-top: 2rem; background: var(--bg-panel); padding: 1.5rem; border-radius: 8px; border: 1px solid var(--border); }}
     .stats-container {{ margin-top: 2rem; background: var(--bg-panel); padding: 1rem; border-radius: 8px; border: 1px solid var(--border); }}
 
     /* Tables */
@@ -399,6 +459,7 @@ async def index(request: Request):
 
     /* Typography */
     h1 {{ margin: 0; font-size: 1.5rem; display: flex; align-items: center; gap: 0.5rem; }}
+    h2 {{ margin-top: 0; font-size: 1.25rem; color: var(--primary); }}
     code {{ font-family: 'Menlo', 'Monaco', monospace; background: #1f2937; padding: 0.2rem 0.4rem; border-radius: 4px; color: #60a5fa; font-size: 0.9em; }}
     .text-muted {{ color: var(--text-muted); }}
     .text-sm {{ font-size: 0.8rem; }}
@@ -407,9 +468,14 @@ async def index(request: Request):
     /* Forms & Inputs */
     input {{ background: #1f2937; border: 1px solid #4b5563; color: var(--text-main); border-radius: 4px; padding: 0.35rem 0.5rem; font-size: 0.85rem; }}
     input:focus {{ outline: 2px solid var(--primary); border-color: transparent; }}
+    input:disabled {{ opacity: 0.5; cursor: not-allowed; }}
     .input-ctx {{ width: 6rem; }}
     .input-args {{ width: 12rem; }}
     .input-backend {{ width: 100%; margin-top: 0.25rem; }}
+    .form-group {{ margin-bottom: 0.75rem; }}
+    .form-label {{ display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.25rem; }}
+    .form-control {{ width: 100%; }}
+    .checkbox-wrapper {{ display: flex; align-items: center; gap: 0.5rem; }}
 
     /* Buttons */
     button {{ cursor: pointer; border: none; border-radius: 4px; padding: 0.35rem 0.75rem; font-size: 0.85rem; font-weight: 500; transition: all 0.15s; color: white; }}
@@ -424,6 +490,8 @@ async def index(request: Request):
     .btn-outline {{ background: transparent; border: 1px solid #4b5563; }}
     .btn-outline:hover {{ background: #374151; }}
     .btn-xs {{ padding: 0.2rem 0.5rem; font-size: 0.75rem; }}
+    .btn-trash {{ color: #ef4444; border-color: #7f1d1d; }}
+    .btn-trash:hover {{ background: #7f1d1d; color: white; }}
 
     /* Flex Utilities */
     .mt-1 {{ margin-top: 0.5rem; }}
@@ -433,6 +501,12 @@ async def index(request: Request):
     .status-badge {{ display: inline-block; padding: 0.2rem 0.6rem; border-radius: 99px; font-size: 0.75rem; font-weight: bold; background: #374151; color: #9ca3af; }}
     .status-badge.loaded {{ background: #064e3b; color: #6ee7b7; border: 1px solid #059669; }}
 
+    /* Modal / Dialog */
+    .modal {{ display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 9000; align-items: center; justify-content: center; }}
+    .modal-content {{ background: var(--bg-panel); padding: 1.5rem; border-radius: 8px; border: 1px solid var(--border); width: 90%; max-width: 500px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }}
+    .modal-actions {{ display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.5rem; }}
+    .modal-title {{ font-size: 1.25rem; font-weight: bold; margin-bottom: 1rem; color: #f3f4f6; }}
+    
     /* Loading Overlay */
     #loading-overlay {{
         display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -445,10 +519,159 @@ async def index(request: Request):
     }}
     @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
 
+    /* Progress Log */
+    #pull-progress {{
+        margin-top: 1rem; background: #000; padding: 1rem; border-radius: 4px; 
+        font-family: monospace; font-size: 0.8rem; height: 150px; overflow-y: auto;
+        border: 1px solid var(--border); display: none;
+    }}
+    .progress-line {{ margin-bottom: 0.25rem; border-bottom: 1px solid #333; padding-bottom: 0.25rem; }}
+
   </style>
   <script>
     function showLoading() {{
         document.getElementById('loading-overlay').style.display = 'flex';
+    }}
+
+    // --- Delete Feature Scripts ---
+    let deleteModelTarget = "";
+    
+    function showDeleteConfirm(modelName) {{
+        deleteModelTarget = modelName;
+        document.getElementById('delete-target-name').innerText = modelName;
+        document.getElementById('delete-modal').style.display = 'flex';
+    }}
+
+    function closeDeleteModal() {{
+        document.getElementById('delete-modal').style.display = 'none';
+        deleteModelTarget = "";
+    }}
+
+    function confirmDelete() {{
+        if(!deleteModelTarget) return;
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '/delete_model';
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'model_name';
+        input.value = deleteModelTarget;
+        form.appendChild(input);
+        document.body.appendChild(form);
+        showLoading();
+        form.submit();
+    }}
+
+    // --- Pull Feature Scripts ---
+    function toggleMmproj() {{
+        const chk = document.getElementById('mmproj_enabled');
+        const txt = document.getElementById('mmproj_input');
+        txt.disabled = !chk.checked;
+        if (!chk.checked) txt.value = "";
+    }}
+
+    function showPullConfirm(e) {{
+        e.preventDefault();
+        // Gather values for display
+        const mName = document.getElementById('pull_model_name').value;
+        const mCheck = document.getElementById('pull_checkpoint').value;
+        const mRecipe = document.getElementById('pull_recipe').value;
+        
+        document.getElementById('conf_m_name').innerText = mName;
+        document.getElementById('conf_m_check').innerText = mCheck;
+        document.getElementById('conf_m_recipe').innerText = mRecipe;
+        
+        document.getElementById('pull-modal').style.display = 'flex';
+    }}
+
+    function closePullModal() {{
+        document.getElementById('pull-modal').style.display = 'none';
+    }}
+
+    async function executePull() {{
+        // Switch view to progress
+        document.getElementById('pull-actions').style.display = 'none';
+        document.getElementById('pull-status-msg').innerText = "Initializing download... DO NOT CLOSE THIS WINDOW.";
+        const logBox = document.getElementById('pull-progress');
+        logBox.style.display = 'block';
+        logBox.innerHTML = "<div>Starting stream...</div>";
+
+        // Prepare Form Data
+        const formData = new FormData(document.getElementById('pull-form'));
+        
+        try {{
+            const response = await fetch('/pull/stream', {{
+                method: 'POST',
+                body: formData
+            }});
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            
+            let buffer = "";
+            let currentEvent = null; // Track the current SSE event type
+
+            while (true) {{
+                const {{ done, value }} = await reader.read();
+                if (done) break;
+                
+                // 1. Buffer incoming bytes to handle split lines correctly
+                buffer += decoder.decode(value, {{stream: true}});
+                const lines = buffer.split('\\n');
+                
+                // Keep the last line in the buffer as it might be incomplete
+                buffer = lines.pop(); 
+                
+                for (const line of lines) {{
+                    const trimmed = line.trim();
+                    if (!trimmed) continue;
+
+                    // 2. Parse Event Type
+                    if (trimmed.startsWith('event:')) {{
+                        currentEvent = trimmed.substring(6).trim();
+                    }}
+                    // 3. Parse Data
+                    else if (trimmed.startsWith('data:')) {{
+                        const jsonStr = trimmed.substring(5).trim();
+                        try {{
+                            const data = JSON.parse(jsonStr);
+
+                            // CHECK: Error
+                            if (currentEvent === 'error' || data.error) {{
+                                logBox.innerHTML += `<div style="color:red">Error: ${{data.error || 'Unknown'}}</div>`;
+                                return; // Stop execution
+                            }}
+
+                            // CHECK: Complete -> BREAK LOOP
+                            if (currentEvent === 'complete') {{
+                                logBox.innerHTML += "<div style='color:#6ee7b7; font-weight:bold; margin-top:10px;'>Download Complete. Reloading...</div>";
+                                logBox.scrollTop = logBox.scrollHeight;
+                                setTimeout(() => window.location.reload(), 2000);
+                                return; // explicit exit
+                            }}
+
+                            // CHECK: Progress
+                            if (currentEvent === 'progress' || data.percent) {{
+                                // Optimization: Update a single element to prevent infinite scrolling spam
+                                let statusLine = document.getElementById('progress-dynamic');
+                                if (!statusLine) {{
+                                    statusLine = document.createElement('div');
+                                    statusLine.id = 'progress-dynamic';
+                                    statusLine.className = 'progress-line';
+                                    logBox.appendChild(statusLine);
+                                }}
+                                statusLine.innerText = `Downloading ${{data.file || 'file'}}... ${{data.percent}}%`;
+                            }}
+                        }} catch (e) {{
+                           // Ignore parse errors from malformed/interrupted lines
+                        }}
+                    }}
+                }}
+            }}
+        }} catch (err) {{
+            logBox.innerHTML += `<div style="color:red">Network Error: ${{err}}</div>`;
+            document.getElementById('pull-actions').style.display = 'flex';
+        }}
     }}
   </script>
 </head>
@@ -456,7 +679,41 @@ async def index(request: Request):
 
   <div id="loading-overlay">
     <div class="spinner"></div>
-    <div>Processing... please wait (up to {int(TIMEOUT_LOAD)}s)</div>
+    <div>Processing... please wait</div>
+  </div>
+
+  <div id="delete-modal" class="modal">
+    <div class="modal-content">
+        <div class="modal-title" style="color:#ef4444">⚠️ Delete Model?</div>
+        <p>Are you sure you want to delete <strong><span id="delete-target-name"></span></strong>?</p>
+        <p>This will remove the files from disk. <span style="color:#ef4444; font-weight:bold;">This action is irreversible.</span></p>
+        <div class="modal-actions">
+            <button onclick="closeDeleteModal()" class="btn-secondary">Cancel</button>
+            <button onclick="confirmDelete()" class="btn-red">Yes, Delete</button>
+        </div>
+    </div>
+  </div>
+
+  <div id="pull-modal" class="modal">
+    <div class="modal-content">
+        <div class="modal-title">Confirm Download</div>
+        <div id="pull-status-msg">
+            <p>You are about to pull the following model:</p>
+            <ul>
+                <li><strong>Name:</strong> <span id="conf_m_name"></span></li>
+                <li><strong>Checkpoint:</strong> <span id="conf_m_check"></span></li>
+                <li><strong>Recipe:</strong> <span id="conf_m_recipe"></span></li>
+            </ul>
+            <p class="text-sm text-muted">Timeout set to: {int(TIMEOUT_PULL)}s. Large models may take a long time.</p>
+        </div>
+        
+        <div id="pull-progress"></div>
+
+        <div class="modal-actions" id="pull-actions">
+            <button onclick="closePullModal()" class="btn-secondary">Cancel</button>
+            <button onclick="executePull()" class="btn-primary">Yes, Pull Model</button>
+        </div>
+    </div>
   </div>
 
   <div class="toolbar">
@@ -484,6 +741,40 @@ async def index(request: Request):
       {''.join(rows)}
     </tbody>
   </table>
+  </div>
+
+  <div class="section-container">
+    <h2>⬇️ Pull New Model</h2>
+    <form id="pull-form" onsubmit="showPullConfirm(event)">
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+            
+            <div class="form-group">
+                <label class="form-label">Model Name (Namespace required)</label>
+                <input type="text" id="pull_model_name" name="model_name" class="form-control" value="user." required>
+            </div>
+            
+            <div class="form-group">
+                <label class="form-label">Checkpoint (HuggingFace ID)</label>
+                <input type="text" id="pull_checkpoint" name="checkpoint" class="form-control" placeholder="e.g. unsloth/Phi-4-mini-instruct-GGUF:Q4_K_M" required>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">Recipe</label>
+                <input type="text" id="pull_recipe" name="recipe" class="form-control" placeholder="e.g. llamacpp" required>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="mmproj_enabled">Multimodal Projector (Optional)</label>
+                <div class="checkbox-wrapper">
+                    <input type="checkbox" id="mmproj_enabled" onclick="toggleMmproj()">
+                    <input type="text" id="mmproj_input" name="mmproj" class="form-control" placeholder="mmproj file path" disabled>
+                </div>
+            </div>
+        </div>
+        <div style="margin-top: 1rem;">
+            <button type="submit" class="btn-primary">Pull Model</button>
+        </div>
+    </form>
   </div>
 
   <p class="text-muted text-sm" style="margin-top:1rem;">
@@ -523,10 +814,9 @@ async def load_model_defaults(
     """
     Action: 'Load (Default)'. 
     Reads ctx/args from recipe_options.json.
-    However, if the user typed a backend, that overrides the file (common workflow).
+    Backend override is preserved if user typed it.
     """
     options = get_model_options(model_name)
-
     ctx_size = options.get("ctx_size")
     llamacpp_args = options.get("llamacpp_args")
 
@@ -550,13 +840,19 @@ async def set_defaults(
 @app.post("/unload")
 async def unload_all_models_action():
     async with httpx.AsyncClient(timeout=TIMEOUT_LIGHT) as client:
-        r = await client.post(f"{LEMONADE_BASE}/api/v1/unload")
+        r = await client.post(f"{LEMONADE_BASE}/api/v1/unload", headers=get_headers())
         r.raise_for_status()
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/unload/model")
 async def unload_one_model_action(model_name: str = Form(...)):
     await do_unload_model(model_name)
+    return RedirectResponse(url="/", status_code=303)
+
+@app.post("/delete_model")
+async def delete_model_action(model_name: str = Form(...)):
+    """Handles the model deletion request."""
+    await do_delete_model(model_name)
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/disable")
@@ -567,14 +863,69 @@ async def disable_model_action(
     set_disabled(model_name, disabled == "1")
     return RedirectResponse(url="/", status_code=303)
 
+@app.post("/pull/stream")
+async def pull_model_stream(
+    model_name: str = Form(...),
+    checkpoint: str = Form(...),
+    recipe: str = Form(...),
+    mmproj: Optional[str] = Form(None)
+):
+    """
+    Proxies the Pull request to Lemonade Server with stream=true.
+    Returns an event stream to the frontend for the progress bar.
+    """
+    payload = {
+        "model_name": model_name,
+        "checkpoint": checkpoint,
+        "recipe": recipe,
+        "stream": True 
+    }
+    if mmproj and mmproj.strip():
+        payload["mmproj"] = mmproj.strip()
+
+    # Create a generator to stream bytes from the upstream server to the client
+    async def event_generator() -> AsyncGenerator[bytes, None]:
+        # Increase connection pool limits and keepalive specifically for this long request
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10, keepalive_expiry=TIMEOUT_PULL)
+        
+        async with httpx.AsyncClient(timeout=TIMEOUT_PULL, limits=limits) as client:
+            try:
+                # Use build_request/send to handle the streaming response properly
+                req = client.build_request(
+                    "POST", 
+                    f"{LEMONADE_BASE}/api/v1/pull", 
+                    json=payload,
+                    headers=get_headers()
+                )
+                r = await client.send(req, stream=True)
+                r.raise_for_status()
+                
+                async for chunk in r.aiter_bytes():
+                    yield chunk
+
+            except httpx.RemoteProtocolError:
+                # This specific error means the server hung up
+                err_msg = json.dumps({"error": "Connection lost: Lemonade Server closed the connection. Check server logs for crashes or disk space issues."})
+                yield f"data: {err_msg}\n\n".encode('utf-8')
+            except httpx.HTTPStatusError as e:
+                err_msg = json.dumps({"error": f"Upstream Error: {e.response.text}"})
+                yield f"data: {err_msg}\n\n".encode('utf-8')
+            except Exception as e:
+                err_msg = json.dumps({"error": str(e)})
+                yield f"data: {err_msg}\n\n".encode('utf-8')
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 # =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
 if __name__ == "__main__":
-    print(f"Starting Lemonade Manager on port {MANAGER_PORT}...")
+    print(f"Starting Lemonade Manager on {MANAGER_HOST}:{MANAGER_PORT}...")
     print(f"Server Target: {LEMONADE_BASE}")
+    if LEMONADE_KEY:
+        print("API Key:       [Enabled]")
     print(f"Recipe File:   {RECIPE_FILE}")
     print(f"Prefs File:    {PREFS_FILE}")
 
-    uvicorn.run("lemonade_manager:app", host="0.0.0.0", port=MANAGER_PORT, reload=False)
+    uvicorn.run("lemonade_manager:app", host=MANAGER_HOST, port=MANAGER_PORT, reload=False)
